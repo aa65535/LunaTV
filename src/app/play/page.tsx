@@ -499,16 +499,23 @@ function PlayPageClient() {
   function filterAdsFromM3U8(m3u8Content: string): string {
     if (!m3u8Content) return '';
 
-    // 按行分割M3U8内容
-    const lines = m3u8Content.split('\n');
-    const filteredLines = [];
+    // 统一换行，分割行
+    const lines = m3u8Content.replace(/\r\n/g, '\n').split('\n');
+    const filteredLines: string[] = [];
+    let inAdSegment = false;
 
-    for (let i = 0; i < lines.length; i++) {
-      const line = lines[i];
+    for (const rawLine of lines) {
+      const line = rawLine.trim();
 
-      // 只过滤#EXT-X-DISCONTINUITY标识
-      if (!line.includes('#EXT-X-DISCONTINUITY')) {
-        filteredLines.push(line);
+      // 碰到不连续标记，切换广告状态，这一行丢弃
+      if (line.startsWith('#EXT-X-DISCONTINUITY')) {
+        inAdSegment = !inAdSegment;
+        continue;
+      }
+
+      // 不在广告区间才保留该行
+      if (!inAdSegment) {
+        filteredLines.push(rawLine);
       }
     }
 
