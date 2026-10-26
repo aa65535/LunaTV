@@ -17,16 +17,97 @@ on:
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  # PR 的新提交可以取消旧构建；push / release 不取消，避免发布到一半被打断
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  REGISTRY: ghcr.io
 
 permissions:
-  contents: write
-  packages: write
-  actions: write
+  contents: read
 
 jobs:
+  # 统一计算镜像名、标签与是否推送，避免在各 job 中重复推导
+  prepare:
+    name: Prepare metadata
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      image: ${{ steps.vars.outputs.image }}
+      tags: ${{ steps.vars.outputs.tags }}
+      push: ${{ steps.vars.outputs.push }}
+      labels: ${{ steps.meta.outputs.labels }}
+    steps:
+      - name: Checkout source code
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Resolve image name, tags and push flag
+        id: vars
+        env:
+          REPOSITORY: ${{ github.repository }}
+          EVENT_NAME: ${{ github.event_name }}
+          INPUT_TAG: ${{ github.event.inputs.tag }}
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+          PR_NUMBER: ${{ github.event.number }}
+        run: |
+          set -euo pipefail
+
+          # ghcr.io 只允许小写仓库名（本仓库名为 LunaTV，必须转换）
+          image="${REGISTRY}/$(printf '%s' "$REPOSITORY" | tr '[:upper:]' '[:lower:]')"
+
+          tags=""
+          add_tag() {
+            if [ -z "${1:-}" ]; then return 0; fi
+            case ",${tags}," in
+              *",$1,"*) return 0 ;;
+            esac
+            tags="${tags:+$tags,}$1"
+          }
+
+          case "$EVENT_NAME" in
+            release)
+              # 保留原始 tag（兼容带 v 前缀的写法），同时补充 X.Y.Z 与 X.Y
+              add_tag "$RELEASE_TAG"
+              version="${RELEASE_TAG#v}"
+              add_tag "$version"
+              if printf '%s' "$version" | grep -qE '^[^.]+\.[^.]+'; then
+                add_tag "$(printf '%s' "$version" | awk -F. '{print $1"."$2}')"
+              fi
+              push=true
+              ;;
+            pull_request)
+              # PR 只做构建校验，不推送任何镜像
+              add_tag "pr-${PR_NUMBER}"
+              push=false
+              ;;
+            *)
+              add_tag "${INPUT_TAG:-latest}"
+              push=true
+              ;;
+          esac
+
+          {
+            echo "image=$image"
+            echo "push=$push"
+            echo "tags<<__TAGS__"
+            printf '%s\n' "$tags" | tr ',' '\n'
+            echo "__TAGS__"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Extract OCI labels
+        id: meta
+        uses: docker/metadata-action@v6
+        with:
+          images: ${{ steps.vars.outputs.image }}
+          tags: type=raw,value=${{ github.sha }}
+
   build:
+    name: Build ${{ matrix.platform }}
+    needs: prepare
     strategy:
+      fail-fast: false
       matrix:
         include:
           - platform: linux/amd64
@@ -34,81 +115,82 @@ jobs:
           - platform: linux/arm64
             os: ubuntu-24.04-arm
     runs-on: ${{ matrix.os }}
-
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      packages: write
     steps:
-      - name: Prepare platform name
+      - name: Prepare platform pair
+        env:
+          PLATFORM: ${{ matrix.platform }}
         run: |
-          echo "PLATFORM_NAME=${{ matrix.platform }}" | sed 's|/|-|g' >> $GITHUB_ENV
-
-      - name: Determine Docker tag
-        id: docker-tag
-        run: |
-          if [ "${{ github.event_name }}" = "release" ]; then
-            echo "tag=${{ github.event.release.tag_name }}" >> "$GITHUB_OUTPUT"
-          else
-            echo "tag=${{ github.event.inputs.tag || 'latest' }}" >> "$GITHUB_OUTPUT"
-          fi
+          set -euo pipefail
+          echo "PLATFORM_PAIR=${PLATFORM//\//-}" >> "$GITHUB_ENV"
 
       - name: Checkout source code
         uses: actions/checkout@v7
+        with:
+          persist-credentials: false
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v4
+        with:
+          # 缓存 buildx 二进制，减少每次 setup 的下载耗时
+          cache-binary: true
 
       - name: Login to GitHub Container Registry
+        if: needs.prepare.outputs.push == 'true'
         uses: docker/login-action@v4
         with:
-          registry: ghcr.io
+          registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Set lowercase repository owner
-        id: lowercase
-        run: echo "owner=$(echo '${{ github.repository_owner }}' | tr '[:upper:]' '[:lower:]')" >> "$GITHUB_OUTPUT"
-
-      - name: Extract metadata
-        id: meta
-        uses: docker/metadata-action@v6
-
-        with:
-          images: ghcr.io/aa65535/lunatv
-          tags: |
-            type=raw,value=${{ github.event.inputs.tag || 'latest' }},enable={{is_default_branch}}
-            type=semver,pattern={{version}},enable=${{ github.event_name == 'release' }}
-            type=semver,pattern={{major}}.{{minor}},enable=${{ github.event_name == 'release' }}
-
-      - name: Build and push by digest
+      - name: Build and export by digest
         id: build
         uses: docker/build-push-action@v7
         with:
           context: .
           file: ./Dockerfile
           platforms: ${{ matrix.platform }}
-          labels: ${{ steps.meta.outputs.labels }}
-          tags: ghcr.io/aa65535/lunatv:${{ steps.docker-tag.outputs.tag }}
-          outputs: type=image,name=ghcr.io/aa65535/lunatv,name-canonical=true,push=true
+          labels: ${{ needs.prepare.outputs.labels }}
+          # 每个平台独立 runner，缓存必须按平台分 scope，否则互相覆盖
+          cache-from: type=gha,scope=build-${{ env.PLATFORM_PAIR }}
+          cache-to: type=gha,mode=max,scope=build-${{ env.PLATFORM_PAIR }}
+          outputs: ${{ needs.prepare.outputs.push == 'true' && format('type=image,name={0},name-canonical=true,push=true', needs.prepare.outputs.image) || 'type=cacheonly' }}
 
       - name: Export digest
+        if: needs.prepare.outputs.push == 'true'
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
         run: |
+          set -euo pipefail
           mkdir -p /tmp/digests
-          digest="${{ steps.build.outputs.digest }}"
-          touch "/tmp/digests/${digest#sha256:}"
+          touch "/tmp/digests/${DIGEST#sha256:}"
 
       - name: Upload digest
+        if: needs.prepare.outputs.push == 'true'
         uses: actions/upload-artifact@v7
         with:
-          name: digests-${{ env.PLATFORM_NAME }}
+          name: digests-${{ env.PLATFORM_PAIR }}
           path: /tmp/digests/*
           if-no-files-found: error
           retention-days: 1
 
   merge:
-    runs-on: ubuntu-latest
+    name: Merge manifests
     needs:
+      - prepare
       - build
+    if: needs.prepare.outputs.push == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      packages: write
     steps:
       - name: Download digests
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           path: /tmp/digests
           pattern: digests-*
@@ -116,43 +198,95 @@ jobs:
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v4
+        with:
+          cache-binary: true
 
       - name: Login to GitHub Container Registry
         uses: docker/login-action@v4
         with:
-          registry: ghcr.io
+          registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Set lowercase repository owner
-        id: lowercase
-        run: echo "owner=$(echo '${{ github.repository_owner }}' | tr '[:upper:]' '[:lower:]')" >> "$GITHUB_OUTPUT"
-
-      - name: Determine Docker tag
-        id: docker-tag
-        run: |
-          if [ "${{ github.event_name }}" = "release" ]; then
-            echo "tag=${{ github.event.release.tag_name }}" >> "$GITHUB_OUTPUT"
-          else
-            echo "tag=${{ github.event.inputs.tag || 'latest' }}" >> "$GITHUB_OUTPUT"
-          fi
-
       - name: Create manifest list and push
         working-directory: /tmp/digests
+        env:
+          IMAGE: ${{ needs.prepare.outputs.image }}
+          TAGS: ${{ needs.prepare.outputs.tags }}
         run: |
-          docker buildx imagetools create -t ghcr.io/aa65535/lunatv:${{ steps.docker-tag.outputs.tag }} \
-            $(printf 'ghcr.io/aa65535/lunatv@sha256:%s ' *)
+          set -euo pipefail
 
-  cleanup-refresh:
+          tag_args=()
+          while IFS= read -r tag; do
+            if [ -z "$tag" ]; then continue; fi
+            tag_args+=( -t "$IMAGE:$tag" )
+          done <<< "$TAGS"
+          if [ ${#tag_args[@]} -eq 0 ]; then
+            echo "::error::未解析出任何 Docker 标签"
+            exit 1
+          fi
+
+          refs=()
+          for digest in *; do
+            if [ ! -f "$digest" ]; then continue; fi
+            refs+=( "$IMAGE@sha256:$digest" )
+          done
+          if [ ${#refs[@]} -eq 0 ]; then
+            echo "::error::未找到任何平台 digest"
+            exit 1
+          fi
+
+          docker buildx imagetools create "${tag_args[@]}" "${refs[@]}"
+
+      - name: Inspect image
+        env:
+          IMAGE: ${{ needs.prepare.outputs.image }}
+          TAGS: ${{ needs.prepare.outputs.tags }}
+        run: |
+          set -euo pipefail
+          first_tag="$(printf '%s\n' "$TAGS" | sed -n '1p')"
+          docker buildx imagetools inspect "$IMAGE:$first_tag" | tee /tmp/inspect.txt
+
+      - name: Write job summary
+        env:
+          IMAGE: ${{ needs.prepare.outputs.image }}
+          TAGS: ${{ needs.prepare.outputs.tags }}
+        run: |
+          set -euo pipefail
+          {
+            echo "### 已发布镜像"
+            echo
+            echo "| Tag | 拉取命令 |"
+            echo "| --- | --- |"
+            while IFS= read -r tag; do
+              if [ -z "$tag" ]; then continue; fi
+              printf '| `%s` | `docker pull %s:%s` |\n' "$tag" "$IMAGE" "$tag"
+            done <<< "$TAGS"
+            echo
+            echo "**平台**：linux/amd64、linux/arm64"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  cleanup:
+    name: Cleanup old runs
+    needs: merge
+    # 无论构建成功与否都清理历史运行记录，避免 Actions 记录无限堆积
+    if: ${{ always() && github.event_name != 'pull_request' }}
     runs-on: ubuntu-latest
-    needs:
-      - merge
-    if: always()
+    timeout-minutes: 10
+    permissions:
+      actions: write
     steps:
-      - name: Delete workflow runs
-        uses: Mattraks/delete-workflow-runs@main
-        with:
-          token: ${{ secrets.GITHUB_TOKEN }}
-          repository: ${{ github.repository }}
-          retain_days: 0
-          keep_minimum_runs: 2
+      - name: Delete old workflow runs
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          GH_WORKFLOW: ${{ github.workflow }}
+        run: |
+          set -euo pipefail
+          # 保留最近 2 次运行记录
+          gh run list --repo "$GH_REPO" --workflow "$GH_WORKFLOW" --limit 100 \
+            --json databaseId --jq '.[].databaseId' | tail -n +3 > ids.txt
+          while IFS= read -r id; do
+            if [ -z "$id" ]; then continue; fi
+            gh run delete --repo "$GH_REPO" "$id" || echo "跳过 $id"
+          done < ids.txt
