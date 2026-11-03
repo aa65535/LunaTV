@@ -572,13 +572,22 @@ function PlayPageClient() {
 
     if (segments.length === 0) return m3u8Content;
 
-    const getHost = (uri: string): string => {
+    const getUrlPath = (uri: string): string => {
       try {
-        const normalized = uri.startsWith('//') ? `http:${uri}` : uri;
-        return new URL(normalized).hostname.toLowerCase();
+        const normalized = uri.startsWith('//')
+          ? `http:${uri}`
+          : uri;
+        const url = new URL(normalized, 'http://example.com');
+        return url.pathname;
       } catch {
-        return '';
+        return uri.split(/[?#]/)[0];
       }
+    };
+
+    const getPathPrefix = (uri: string): string => {
+      const path = getUrlPath(uri);
+      const lastSlash = path.lastIndexOf('/');
+      return lastSlash >= 0 ? path.slice(0, lastSlash + 1) : '/';
     };
 
     const isAdUri = (uri: string): boolean => {
@@ -594,14 +603,21 @@ function PlayPageClient() {
       );
     };
 
-    // 统计出现次数最多的域名，作为“正常内容”的基准
-    const hostCounts = new Map<string, number>();
+    // 统计出现次数最多的路径前缀，作为“正常内容”的基准
+    const prefixCounts = new Map<string, number>();
     for (const seg of segments) {
-      const host = getHost(seg.uri);
-      if (host) hostCounts.set(host, (hostCounts.get(host) ?? 0) + 1);
+      const prefix = getPathPrefix(seg.uri);
+      prefixCounts.set(prefix, (prefixCounts.get(prefix) ?? 0) + 1);
     }
-    const dominantHost =
-      Array.from(hostCounts).sort((a, b) => b[1] - a[1])[0]?.[0] ?? '';
+
+    let dominantPrefix = '';
+    let maxPrefixCount = 0;
+    prefixCounts.forEach((count, prefix) => {
+      if (count > maxPrefixCount) {
+        maxPrefixCount = count;
+        dominantPrefix = prefix;
+      }
+    });
 
     // 先标记明确广告和 URI 命中
     const isAd = new Array<boolean>(segments.length).fill(false);
@@ -621,8 +637,7 @@ function PlayPageClient() {
     });
     if (currentBlock.length > 0) blocks.push(currentBlock);
 
-    // 只有“两侧都有 DISCONTINUITY”的块才认为是完整插入块，
-    // 首尾块可能只是正常片头/片尾，不作为整体删除的依据
+    // 只有“两侧都有 DISCONTINUITY”的块才认为是完整插入块
     const boundedBlocks = blocks.filter((_, blockIndex) => {
       const isFirst = blockIndex === 0;
       const isLast = blockIndex === blocks.length - 1;
@@ -634,22 +649,28 @@ function PlayPageClient() {
 
     for (const block of boundedBlocks) {
       const segs = block.map((i) => segments[i]);
-      const hosts = segs.map((s) => getHost(s.uri));
-      const allForeignHost =
-        hosts.length > 0 &&
-        hosts.every((host) => host !== '' && host !== dominantHost);
-      const hasAdSignal = segs.some((s) => s.explicitAd || isAdUri(s.uri));
-      if (allForeignHost || hasAdSignal) {
+      const prefixes = segs.map((s) => getPathPrefix(s.uri));
+      const allSamePrefix =
+        prefixes.length > 0 && prefixes.every((p) => p === prefixes[0]);
+      const prefixDiffers = allSamePrefix && prefixes[0] !== dominantPrefix;
+      const totalDuration = segs.reduce(
+        (sum, s) => sum + (s.duration ?? 0),
+        0
+      );
+      const isShortBlock = segs.length <= 6 && totalDuration <= 30;
+      const hasAdSignal = segs.some(
+        (s) => s.explicitAd || isAdUri(s.uri)
+      );
+
+      if ((prefixDiffers && isShortBlock) || hasAdSignal) {
         block.forEach((i) => {
           isAd[i] = true;
         });
       }
     }
 
-    // 没有检测到广告时直接返回原文，避免无意义改动
     if (!isAd.some(Boolean)) return m3u8Content;
 
-    // 删除命中的分片（#EXTINF 到 URI 的整段），其余行原样保留
     const removeRanges = segments
       .map((seg, index) => ({seg, remove: isAd[index]}))
       .filter((item) => item.remove)
