@@ -589,7 +589,7 @@ function PlayPageClient() {
         // 保留原始值
       }
       const pathOnly = decoded.split(/[?#]/)[0];
-      return /(?:^|[\/._-])(?:ad|ads|adv|advert|adverts|advertisements?|adserver|adcdn|admob|doubleclick)(?:\d+)?(?:[\/._-]|$)/i.test(
+      return /(?:^|[/._-])(?:ad|ads|adv|advert|adverts|advertisements?|adserver|adcdn|admob|doubleclick)(?:\d+)?(?:[/._-]|$)/i.test(
         pathOnly
       );
     };
