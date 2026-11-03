@@ -499,27 +499,173 @@ function PlayPageClient() {
   function filterAdsFromM3U8(m3u8Content: string): string {
     if (!m3u8Content) return '';
 
-    // 统一换行，分割行
     const lines = m3u8Content.replace(/\r\n/g, '\n').split('\n');
-    const filteredLines: string[] = [];
-    let inAdSegment = false;
 
-    for (const rawLine of lines) {
-      const line = rawLine.trim();
+    // 主播放列表（多码率）不做处理，避免误删子播放列表入口
+    if (
+      lines.some((line) => line.trim().startsWith('#EXT-X-STREAM-INF')) ||
+      lines.some((line) => line.trim().startsWith('#EXT-X-I-FRAME-STREAM-INF'))
+    ) {
+      return m3u8Content;
+    }
 
-      // 碰到不连续标记，切换广告状态，这一行丢弃
-      if (line.startsWith('#EXT-X-DISCONTINUITY')) {
-        inAdSegment = !inAdSegment;
+    type Segment = {
+      start: number;
+      end: number;
+      duration: number | null;
+      uri: string;
+      explicitAd: boolean;
+      hasDiscontinuityBefore: boolean;
+    };
+
+    const segments: Segment[] = [];
+    let inAdBreak = false;
+    let pendingDiscontinuity = false;
+    let currentSegment: Segment | null = null;
+
+    const parseDuration = (line: string): number | null => {
+      const match = line.match(/^#EXTINF:([\d.]+)/i);
+      return match ? Number(match[1]) : null;
+    };
+
+    for (let i = 0; i < lines.length; i++) {
+      const line = lines[i].trim();
+
+      if (!line) continue;
+
+      if (/^#EXT-X-DISCONTINUITY(?:\s|$)/.test(line)) {
+        pendingDiscontinuity = true;
         continue;
       }
 
-      // 不在广告区间才保留该行
-      if (!inAdSegment) {
-        filteredLines.push(rawLine);
+      if (line.startsWith('#EXT-X-CUE-OUT') || /SCTE35-OUT/i.test(line)) {
+        inAdBreak = true;
+        continue;
+      }
+
+      if (line.startsWith('#EXT-X-CUE-IN') || /SCTE35-IN/i.test(line)) {
+        inAdBreak = false;
+        continue;
+      }
+
+      if (line.startsWith('#EXTINF:')) {
+        currentSegment = {
+          start: i,
+          end: -1,
+          duration: parseDuration(line),
+          uri: '',
+          explicitAd: inAdBreak,
+          hasDiscontinuityBefore: pendingDiscontinuity,
+        };
+        pendingDiscontinuity = false;
+        continue;
+      }
+
+      // 分片 URI 行（非注释行）
+      if (currentSegment && !line.startsWith('#')) {
+        currentSegment.uri = line;
+        currentSegment.end = i;
+        segments.push(currentSegment);
+        currentSegment = null;
       }
     }
 
-    return filteredLines.join('\n');
+    if (segments.length === 0) return m3u8Content;
+
+    const getHost = (uri: string): string => {
+      try {
+        const normalized = uri.startsWith('//') ? `http:${uri}` : uri;
+        return new URL(normalized).hostname.toLowerCase();
+      } catch {
+        return '';
+      }
+    };
+
+    const isAdUri = (uri: string): boolean => {
+      let decoded = uri;
+      try {
+        decoded = decodeURIComponent(uri);
+      } catch {
+        // 保留原始值
+      }
+      const pathOnly = decoded.split(/[?#]/)[0];
+      return /(?:^|[\/._-])(?:ad|ads|adv|advert|adverts|advertisements?|adserver|adcdn|admob|doubleclick)(?:\d+)?(?:[\/._-]|$)/i.test(
+        pathOnly
+      );
+    };
+
+    // 统计出现次数最多的域名，作为“正常内容”的基准
+    const hostCounts = new Map<string, number>();
+    for (const seg of segments) {
+      const host = getHost(seg.uri);
+      if (host) hostCounts.set(host, (hostCounts.get(host) ?? 0) + 1);
+    }
+    const dominantHost =
+      [...hostCounts.entries()].sort((a, b) => b[1] - a[1])[0]?.[0] ?? '';
+
+    // 先标记明确广告和 URI 命中
+    const isAd = new Array<boolean>(segments.length).fill(false);
+    segments.forEach((seg, index) => {
+      if (seg.explicitAd || isAdUri(seg.uri)) isAd[index] = true;
+    });
+
+    // 按 DISCONTINUITY 分块
+    const blocks: number[][] = [];
+    let currentBlock: number[] = [];
+    segments.forEach((seg, index) => {
+      if (seg.hasDiscontinuityBefore && currentBlock.length > 0) {
+        blocks.push(currentBlock);
+        currentBlock = [];
+      }
+      currentBlock.push(index);
+    });
+    if (currentBlock.length > 0) blocks.push(currentBlock);
+
+    // 只有“两侧都有 DISCONTINUITY”的块才认为是完整插入块，
+    // 首尾块可能只是正常片头/片尾，不作为整体删除的依据
+    const boundedBlocks = blocks.filter((_, blockIndex) => {
+      const isFirst = blockIndex === 0;
+      const isLast = blockIndex === blocks.length - 1;
+      const leftBounded =
+        !isFirst || (segments[0]?.hasDiscontinuityBefore ?? false);
+      const rightBounded = !isLast || pendingDiscontinuity;
+      return leftBounded && rightBounded;
+    });
+
+    for (const block of boundedBlocks) {
+      const segs = block.map((i) => segments[i]);
+      const hosts = segs.map((s) => getHost(s.uri));
+      const allForeignHost =
+        hosts.length > 0 &&
+        hosts.every((host) => host !== '' && host !== dominantHost);
+      const hasAdSignal = segs.some((s) => s.explicitAd || isAdUri(s.uri));
+      if (allForeignHost || hasAdSignal) {
+        block.forEach((i) => {
+          isAd[i] = true;
+        });
+      }
+    }
+
+    // 没有检测到广告时直接返回原文，避免无意义改动
+    if (!isAd.some(Boolean)) return m3u8Content;
+
+    // 删除命中的分片（#EXTINF 到 URI 的整段），其余行原样保留
+    const removeRanges = segments
+      .map((seg, index) => ({seg, remove: isAd[index]}))
+      .filter((item) => item.remove)
+      .map((item) => [item.seg.start, item.seg.end] as const);
+
+    const resultLines = lines.filter(
+      (_, index) =>
+        !removeRanges.some(([start, end]) => index >= start && index <= end)
+    );
+
+    // 如果过滤后没有任何分片，说明误判概率极高，直接回退原文
+    if (!resultLines.some((line) => line.trim().startsWith('#EXTINF:'))) {
+      return m3u8Content;
+    }
+
+    return resultLines.join('\n');
   }
 
   // 跳过片头片尾配置相关函数
