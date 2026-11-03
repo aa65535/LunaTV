@@ -589,7 +589,7 @@ function PlayPageClient() {
         // 保留原始值
       }
       const pathOnly = decoded.split(/[?#]/)[0];
-      return /(?:^|[\/._-])(?:ad|ads|adv|advert|adverts|advertisements?|adserver|adcdn|admob|doubleclick)(?:\d+)?(?:[\/._-]|$)/i.test(
+      return /(?:^|[/._-])(?:ad|ads|adv|advert|adverts|advertisements?|adserver|adcdn|admob|doubleclick)(?:\d+)?(?:[/._-]|$)/i.test(
         pathOnly
       );
     };
@@ -601,7 +601,7 @@ function PlayPageClient() {
       if (host) hostCounts.set(host, (hostCounts.get(host) ?? 0) + 1);
     }
     const dominantHost =
-      [...hostCounts.entries()].sort((a, b) => b[1] - a[1])[0]?.[0] ?? '';
+      Array.from(hostCounts).sort((a, b) => b[1] - a[1])[0]?.[0] ?? '';
 
     // 先标记明确广告和 URI 命中
     const isAd = new Array<boolean>(segments.length).fill(false);
