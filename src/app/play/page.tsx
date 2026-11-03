@@ -601,7 +601,7 @@ function PlayPageClient() {
       if (host) hostCounts.set(host, (hostCounts.get(host) ?? 0) + 1);
     }
     const dominantHost =
-      [...hostCounts.entries()].sort((a, b) => b[1] - a[1])[0]?.[0] ?? '';
+      Array.from(hostCounts).sort((a, b) => b[1] - a[1])[0]?.[0] ?? '';
 
     // 先标记明确广告和 URI 命中
     const isAd = new Array<boolean>(segments.length).fill(false);
